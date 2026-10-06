@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+*.db
+*.db-wal
+*.db-shm
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+# Local Claude Code preview settings
+.claude/
