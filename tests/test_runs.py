@@ -17,6 +17,7 @@ def finished_run(session_factory, make_project) -> int:
             ref="main",
             commit_sha="a" * 40,
             status=RunStatus.FAILED,
+            attempt=1,
             exit_code=1,
             tests_passed=1,
             tests_failed=1,
@@ -52,6 +53,7 @@ def test_get_run(client, finished_run):
     assert response.status_code == 200
     run = response.json()
     assert run["status"] == "failed"
+    assert run["attempt"] == 1
     assert run["commit_sha"] == "a" * 40
     assert (run["tests_passed"], run["tests_failed"], run["tests_skipped"]) == (1, 1, 1)
     assert run["duration_seconds"] == 42.3  # rounded to a tenth of a second

@@ -11,7 +11,7 @@ from app.runner import Outcome
 
 
 class RunStatus(enum.StrEnum):
-    QUEUED = "queued"  # waiting for a worker
+    QUEUED = "queued"  # waiting for a worker, or for another one if its worker died
     RUNNING = "running"
     PASSED = "passed"  # the test command succeeded and no test failed
     FAILED = "failed"  # the tests ran, and one failed or the test command exited non-zero
@@ -85,6 +85,11 @@ class Run(Base):
     commit_sha: Mapped[str | None] = mapped_column(String(64))
     status: Mapped[RunStatus] = mapped_column(_enum_column(RunStatus), default=RunStatus.QUEUED)
     worker_id: Mapped[str | None] = mapped_column(String(255))
+    # How many times a worker has claimed this run: more than once if a worker died
+    # running it. Also the claim's fencing token, see run_queue.Claim.
+    attempt: Mapped[int] = mapped_column(default=0)
+    # The running worker's last sign of life, see run_queue.recover_abandoned_runs.
+    heartbeat_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
     exit_code: Mapped[int | None]
     error: Mapped[str | None] = mapped_column(Text)
     tests_passed: Mapped[int] = mapped_column(default=0)

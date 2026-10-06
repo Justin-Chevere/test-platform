@@ -16,6 +16,8 @@ seconds.
 
 - [x] REST API: register projects, trigger runs, read results, failures and logs
 - [x] Run queue stored in the database, safe with any number of workers
+- [x] Crash recovery: a dead worker's run goes back to the queue (heartbeats and leases), and a
+      worker that was presumed dead can't overwrite its replacement (fencing)
 - [x] Local runner: a fresh checkout and virtualenv for every run, a time limit, and no process
       left running afterwards
 - [x] JUnit XML reports, so any test tool that writes them works (pytest, Jest, Go, Maven...)
@@ -23,14 +25,12 @@ seconds.
 
 ## Next steps
 
-1. **Crashed workers:** heartbeats, so a run whose worker died is retried instead of staying
-   `running` forever.
-2. **Flaky test detection:** flag tests that both pass and fail on the same commit.
-3. **Trends:** slowest tests, failure rates, and how both change over time.
-4. **Docker runner:** run each job in a throwaway container, so untrusted code can't touch the
+1. **Flaky test detection:** flag tests that both pass and fail on the same commit.
+2. **Trends:** slowest tests, failure rates, and how both change over time.
+3. **Docker runner:** run each job in a throwaway container, so untrusted code can't touch the
    machine.
-5. **GitHub integration:** start runs from push webhooks, and report pass or fail on each commit.
-6. **Logins**, then a web dashboard.
+4. **GitHub integration:** start runs from push webhooks, and report pass or fail on each commit.
+5. **Logins**, then a web dashboard.
 
 ## How it works
 
@@ -67,15 +67,46 @@ On SQLite, WAL mode lets the API keep reading while a worker writes. On Postgres
 would use `FOR UPDATE SKIP LOCKED`, so workers skip rows another worker has locked instead of
 waiting for them.
 
+### Crashed workers
+
+A claim is a lease, not ownership forever:
+
+- **Heartbeats:** while a worker executes a run, a background thread stamps the run's
+  `heartbeat_at` every 10 seconds. The worker holds no database transaction open during the run
+  itself, only short ones to claim it and to save the result.
+- **Leases:** a `running` run with no heartbeat for 60 seconds is presumed abandoned: its worker
+  crashed, was killed, or lost its machine. Every worker checks for such runs before claiming
+  one, so recovery needs no extra process: as long as one worker is alive, nothing stays stuck.
+  The run goes back to the queue, and its `attempt` number shows it's a retry.
+- **Attempt limit:** a run is claimed at most 3 times. After that it's marked `error`, so a test
+  that kills its worker every time can't go around forever.
+- **Fencing:** a worker that only *looked* dead (a frozen process, a laptop that went to sleep)
+  can come back after its run was handed to another worker. Each of its writes only applies if the
+  run is still on its attempt number, a *fencing token*, so it can't overwrite its replacement's
+  heartbeats or results; its own result is thrown away instead.
+
+Tried for real: two workers, with one running cloud-resource-manager's test suite until it was
+killed without warning (`TerminateProcess`, the Windows equivalent of `kill -9`). With a 5-second
+lease, the other worker took the run over 4.8 seconds after the kill and finished it: 92 tests
+passed, on attempt 2.
+
+Known limits:
+
+- A killed worker can't clean up after itself: the command it was running keeps going until it
+  ends by itself, with no time limit enforced anymore, and its temporary folder stays behind. A
+  container runner (next steps) fixes both, since a whole container can be removed at once.
+- Each worker timestamps heartbeats with its own clock, so workers on different machines need
+  synchronized clocks (NTP), which keeps them far closer than the 60-second lease.
+
 ### What a run's status means
 
 | Status | Meaning |
 |--------|---------|
-| `queued` | Waiting for a worker |
-| `running` | A worker has it |
+| `queued` | Waiting for a worker, or for another one if its worker died |
+| `running` | A worker has it, and keeps sending heartbeats |
 | `passed` | The test command exited with 0 **and** the report shows no failed or errored test |
 | `failed` | The tests ran: at least one failed, or the test command exited non-zero |
-| `error` | The tests couldn't run or report: unknown branch, failed setup, time limit, no report |
+| `error` | The tests couldn't run or report: unknown branch, failed setup, time limit, no report, or every worker that tried it died |
 
 Both signals have to agree for `passed`: a report can be all green while the command fails on
 something else (a coverage threshold, a crash after the last test), and the reverse.
@@ -160,7 +191,9 @@ ruff check .
 ```
 
 The runner tests use real git repositories, virtualenvs and processes, including a test that
-starts a process tree, lets it hit the time limit, and checks that no child process survived.
+starts a process tree, lets it hit the time limit, and checks that no child process survived. The
+worker tests let a run outlast its lease with heartbeats and without, and replace a worker in the
+middle of a run to check its late result is thrown away.
 
 ## Layout
 
@@ -171,8 +204,8 @@ starts a process tree, lets it hit the time limit, and checks that no child proc
 | `app/models.py` | Database tables: projects, runs, test results |
 | `app/schemas.py` | Request and response shapes, validation |
 | `app/routers/` | HTTP endpoints: health, projects, runs |
-| `app/run_queue.py` | Claims the next queued run, atomically |
-| `app/worker.py` | Worker loop: claim a run, execute it, save the outcome |
+| `app/run_queue.py` | Claims runs atomically, renews leases, recovers abandoned runs |
+| `app/worker.py` | Worker loop: recover, claim, execute with heartbeats, save the outcome if still held |
 | `app/runner/base.py` | The `Runner` interface and the data passed in and out of it |
 | `app/runner/local.py` | Runs a job on this machine: checkout, virtualenv, commands, cleanup |
 | `app/runner/junit.py` | Reads JUnit XML reports |

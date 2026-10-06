@@ -64,6 +64,8 @@ class RunOut(BaseModel):
     commit_sha: str | None
     status: RunStatus
     worker_id: str | None
+    attempt: int
+    heartbeat_at: datetime | None
     exit_code: int | None
     error: str | None
     tests_passed: int

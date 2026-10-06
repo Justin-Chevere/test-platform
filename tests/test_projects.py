@@ -69,7 +69,9 @@ def test_trigger_run_queues_the_default_branch(client):
     run = response.json()
     assert run["status"] == "queued"
     assert run["ref"] == "develop"
+    assert run["attempt"] == 0  # no worker has claimed it yet
     assert run["started_at"] is None
+    assert run["heartbeat_at"] is None
     assert run["duration_seconds"] is None
 
 

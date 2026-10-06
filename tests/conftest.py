@@ -1,10 +1,10 @@
 from collections.abc import Callable, Iterator
+from pathlib import Path
 from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session, sessionmaker
-from sqlalchemy.pool import StaticPool
 
 from app.db import Base, get_db, make_engine
 from app.main import app
@@ -12,12 +12,14 @@ from app.models import Project, Run
 
 
 @pytest.fixture
-def session_factory() -> sessionmaker[Session]:
-    # A fresh in-memory database per test. StaticPool keeps one connection alive,
-    # otherwise every new connection would see its own empty in-memory database.
-    engine = make_engine("sqlite://", poolclass=StaticPool)
+def session_factory(tmp_path: Path) -> Iterator[sessionmaker[Session]]:
+    # A fresh database file per test. A file, not memory: workers use several connections
+    # at once (each heartbeat thread has its own), and an in-memory SQLite database only
+    # exists inside a single connection.
+    engine = make_engine(f"sqlite:///{tmp_path / 'test.db'}")
     Base.metadata.create_all(engine)
-    return sessionmaker(bind=engine, autoflush=False)
+    yield sessionmaker(bind=engine, autoflush=False)
+    engine.dispose()
 
 
 @pytest.fixture
