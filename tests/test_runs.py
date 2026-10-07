@@ -76,6 +76,7 @@ def test_filter_test_results_by_outcome(client, finished_run):
             "outcome": "failed",
             "duration_seconds": 0.2,
             "message": "assert 1 == 2",
+            "quarantined": False,
             "flaky": False,
         }
     ]

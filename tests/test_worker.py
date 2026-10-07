@@ -7,7 +7,7 @@ from sqlalchemy import select
 
 from app.config import Settings
 from app.flaky import find_flaky_tests
-from app.models import Run, RunStatus, TestResult
+from app.models import QuarantinedTest, Run, RunStatus, TestResult
 from app.run_queue import claim_next_run, recover_abandoned_runs
 from app.runner import CaseResult, Outcome, RunResult, RunSpec
 from app.worker import decide_status, execute_run, run_worker
@@ -87,6 +87,88 @@ def _work_through_the_queue(session_factory, runner) -> None:
 )
 def test_decide_status(result, expected):
     assert decide_status(result) == expected
+
+
+REAL_BUG = CaseResult("tests.test_c", "test_real_bug", Outcome.FAILED, 0.1, "assert False")
+QUARANTINED = {("tests.test_a", "test_bad"), ("tests.test_b", "test_crash")}
+
+
+@pytest.mark.parametrize(
+    ("result", "expected"),
+    [
+        # Every failure is in a quarantined test: passed, although the tool exited 1.
+        (RunResult(exit_code=1, cases=(PASSED, FAILED)), RunStatus.PASSED),
+        (RunResult(exit_code=1, cases=(PASSED, ERRORED)), RunStatus.PASSED),
+        # One failure outside quarantine is enough to fail the run.
+        (RunResult(exit_code=1, cases=(FAILED, REAL_BUG)), RunStatus.FAILED),
+        # Nothing failed, so quarantine can't be why the command exited non-zero.
+        (RunResult(exit_code=1, cases=(PASSED,)), RunStatus.FAILED),
+        (RunResult(error="timed out"), RunStatus.ERROR),
+    ],
+)
+def test_decide_status_with_quarantined_tests(result, expected):
+    assert decide_status(result, QUARANTINED) == expected
+
+
+def _quarantine(session_factory, project, case: CaseResult) -> None:
+    # Straight into the table: the evidence check is the API's job, tested there.
+    with session_factory() as db:
+        db.add(
+            QuarantinedTest(
+                project_id=project.id, classname=case.classname, name=case.name, reason="flaky"
+            )
+        )
+        db.commit()
+
+
+def test_failures_in_quarantined_tests_do_not_fail_the_run(
+    session_factory, make_project, queue_run
+):
+    project = make_project()
+    _quarantine(session_factory, project, FAILED)
+    run_id = queue_run(project)
+
+    _execute(session_factory, _claim(session_factory), FakeRunner(FAILING))
+
+    run = _get(session_factory, run_id)
+    assert (run.status, run.tests_failed, run.tests_quarantined) == (RunStatus.PASSED, 1, 1)
+    with session_factory() as db:
+        flags = {result.name: result.quarantined for result in db.scalars(select(TestResult))}
+    assert flags == {"test_ok": False, "test_bad": True}  # the failure is still on record
+    assert len(_all_runs(session_factory)) == 1  # it passed, so there's nothing to rerun
+
+
+def test_a_real_failure_still_fails_a_run_with_quarantined_ones(
+    session_factory, make_project, queue_run
+):
+    project = make_project()
+    _quarantine(session_factory, project, FAILED)
+    run_id = queue_run(project)
+    result = RunResult(commit_sha=COMMIT, exit_code=1, cases=(FAILED, REAL_BUG))
+
+    _execute(session_factory, _claim(session_factory), FakeRunner(result))
+
+    run = _get(session_factory, run_id)
+    assert (run.status, run.tests_failed, run.tests_quarantined) == (RunStatus.FAILED, 2, 1)
+    assert len(_all_runs(session_factory)) == 2  # a real failure, so its commit is rerun
+
+
+def test_the_quarantine_at_the_time_the_run_is_saved_decides(
+    session_factory, make_project, queue_run
+):
+    project = make_project()
+    run_id = queue_run(project)
+
+    def quarantine_meanwhile() -> None:
+        _quarantine(session_factory, project, FAILED)
+
+    _execute(
+        session_factory,
+        _claim(session_factory),
+        FakeRunner(FAILING, while_running=quarantine_meanwhile),
+    )
+
+    assert _get(session_factory, run_id).status == RunStatus.PASSED
 
 
 def test_execute_run_saves_the_outcome_and_every_test(session_factory, make_project, queue_run):

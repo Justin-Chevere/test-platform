@@ -19,6 +19,7 @@ import threading
 import time
 from collections import Counter
 from collections.abc import Iterator
+from collections.abc import Set as AbstractSet
 from contextlib import contextmanager, suppress
 from datetime import UTC, datetime
 
@@ -30,22 +31,32 @@ from app.config import Settings, get_settings
 from app.db import SessionLocal, engine
 from app.migrate import SchemaOutOfDate, check_schema
 from app.models import Project, Run, RunStatus, TestResult
+from app.quarantine import quarantined_test_names
 from app.run_queue import Claim, claim_next_run, held, recover_abandoned_runs, send_heartbeat
 from app.runner import LocalRunner, Outcome, Runner, RunResult, RunSpec
 
 logger = logging.getLogger(__name__)
 
 
-def decide_status(result: RunResult) -> RunStatus:
-    """Passed only if the test command succeeded and the report shows nothing broken.
+def decide_status(
+    result: RunResult, quarantined: AbstractSet[tuple[str, str]] = frozenset()
+) -> RunStatus:
+    """Passed if the test command succeeded and the report shows nothing broken, or if
+    everything broken is a quarantined test.
 
-    Both have to agree: a report can be all green while the command fails on something
-    else (a coverage threshold, a crash after the last test), and the reverse.
+    Normally both have to agree: a report can be all green while the command fails on
+    something else (a coverage threshold, a crash after the last test), and the reverse.
+    Quarantine is the exception: the test tool exits non-zero precisely because the
+    quarantined tests failed, so then the report decides on its own.
     """
     if result.error is not None:
         return RunStatus.ERROR
-    broken = any(case.outcome in (Outcome.FAILED, Outcome.ERROR) for case in result.cases)
-    return RunStatus.PASSED if result.exit_code == 0 and not broken else RunStatus.FAILED
+    broken = [case for case in result.cases if case.outcome in (Outcome.FAILED, Outcome.ERROR)]
+    if not broken:
+        return RunStatus.PASSED if result.exit_code == 0 else RunStatus.FAILED
+    if all((case.classname, case.name) in quarantined for case in broken):
+        return RunStatus.PASSED
+    return RunStatus.FAILED
 
 
 def execute_run(
@@ -65,6 +76,7 @@ def execute_run(
     with session_factory() as db:
         run = db.get_one(Run, claim.run_id)
         project = db.get_one(Project, run.project_id)
+        project_id = project.id
         spec = RunSpec(
             repo_url=project.repo_url,
             ref=run.ref,
@@ -85,9 +97,9 @@ def execute_run(
     except BaseException:
         # Ctrl+C or a shutdown in the middle of a run: record it before stopping.
         stopped = RunResult(error="the worker was stopped during this run")
-        _save(session_factory, claim, stopped, decide_status(stopped))
+        _save(session_factory, claim, stopped, project_id)
         raise
-    if not _save(session_factory, claim, result, decide_status(result)):
+    if not _save(session_factory, claim, result, project_id):
         logger.warning(
             "run #%d: another worker has taken this run over; discarding this result",
             claim.run_id,
@@ -133,11 +145,21 @@ def _heartbeats(
 
 
 def _save(
-    session_factory: sessionmaker[Session], claim: Claim, result: RunResult, status: RunStatus
+    session_factory: sessionmaker[Session], claim: Claim, result: RunResult, project_id: int
 ) -> bool:
     """Record the outcome, but only if the run is still this claim's to finish."""
     counts = Counter(case.outcome for case in result.cases)
     with session_factory() as db:
+        # Read in the same transaction that records the verdict: the quarantine as it is
+        # now decides, even if it changed while the tests were running.
+        quarantined = quarantined_test_names(db, project_id)
+        status = decide_status(result, quarantined)
+        let_through = sum(
+            1
+            for case in result.cases
+            if case.outcome in (Outcome.FAILED, Outcome.ERROR)
+            and (case.classname, case.name) in quarantined
+        )
         # Fenced: matches nothing if the run was handed to another worker meanwhile.
         updated = db.execute(
             update(Run)
@@ -152,6 +174,7 @@ def _save(
                 tests_failed=counts[Outcome.FAILED],
                 tests_errored=counts[Outcome.ERROR],
                 tests_skipped=counts[Outcome.SKIPPED],
+                tests_quarantined=let_through,
                 finished_at=datetime.now(UTC),
             )
         )
@@ -166,6 +189,7 @@ def _save(
                 outcome=case.outcome,
                 duration_seconds=case.duration_seconds,
                 message=case.message,
+                quarantined=(case.classname, case.name) in quarantined,
             )
             for case in result.cases
         )
@@ -174,7 +198,15 @@ def _save(
             rerun_id = _queue_auto_rerun(db, claim.run_id, result.commit_sha)
         # The status, every test result and any rerun land together, or not at all.
         db.commit()
-    logger.info("run #%d: %s", claim.run_id, status)
+    if let_through:
+        logger.info(
+            "run #%d: %s, not counting %d failure(s) in quarantined tests",
+            claim.run_id,
+            status,
+            let_through,
+        )
+    else:
+        logger.info("run #%d: %s", claim.run_id, status)
     if rerun_id is not None:
         logger.info(
             "run #%d: queued run #%d to test commit %s again",

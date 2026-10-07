@@ -77,6 +77,7 @@ class RunOut(BaseModel):
     tests_failed: int
     tests_errored: int
     tests_skipped: int
+    tests_quarantined: int  # failed or errored, but quarantined, so they didn't fail the run
     created_at: datetime
     started_at: datetime | None
     finished_at: datetime | None
@@ -97,6 +98,8 @@ class TestResultOut(BaseModel):
     outcome: Outcome
     duration_seconds: float
     message: str | None
+    # Quarantined when this run was saved: if it failed here, that didn't fail the run.
+    quarantined: bool
     # It has both passed and failed on one commit in this project, so a failure here may
     # be the test's fault rather than the code's.
     flaky: bool = False
@@ -118,3 +121,21 @@ class FlakyTestOut(BaseModel):
     flaky_commits: int  # how many commits it has both passed and failed on
     last_flaked_at: datetime
     latest: FlakyEvidenceOut  # from the most recent of those commits
+
+
+class QuarantineCreate(BaseModel):
+    classname: str = Field(max_length=1000)  # can be empty: some tools don't report one
+    name: str = Field(min_length=1, max_length=1000)
+    reason: str = Field(min_length=1, max_length=500)  # why, and who is fixing it
+
+
+class QuarantinedTestOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    classname: str
+    name: str
+    reason: str
+    created_at: datetime
+    runs_since: int  # runs since it went into quarantine that included the test...
+    failures_since: int  # ...and how many of those it failed or errored in

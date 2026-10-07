@@ -8,7 +8,23 @@ from sqlalchemy.orm import Session
 from app.db import DbSession
 from app.flaky import FlakyTest, find_flaky_tests
 from app.models import Project, Run
-from app.schemas import FlakyTestOut, ProjectCreate, ProjectOut, RunCreate, RunOut
+from app.quarantine import (
+    AlreadyQuarantined,
+    NotFlaky,
+    QuarantineEntry,
+    list_quarantine,
+    quarantine_test,
+    release_test,
+)
+from app.schemas import (
+    FlakyTestOut,
+    ProjectCreate,
+    ProjectOut,
+    QuarantineCreate,
+    QuarantinedTestOut,
+    RunCreate,
+    RunOut,
+)
 
 router = APIRouter(prefix="/projects", tags=["projects"])
 
@@ -70,3 +86,39 @@ def list_flaky_tests(project_id: int, db: DbSession) -> list[FlakyTest]:
     """Tests that both passed and failed on the same commit, most recently flaky first."""
     _get_or_404(db, project_id)
     return find_flaky_tests(db, project_id)
+
+
+@router.get("/{project_id}/quarantine", response_model=list[QuarantinedTestOut])
+def list_quarantined_tests(project_id: int, db: DbSession) -> list[QuarantineEntry]:
+    """Quarantined tests, oldest first, each with how it has done since it went in."""
+    _get_or_404(db, project_id)
+    return list_quarantine(db, project_id)
+
+
+@router.post(
+    "/{project_id}/quarantine",
+    response_model=QuarantinedTestOut,
+    status_code=status.HTTP_201_CREATED,
+)
+def quarantine(project_id: int, payload: QuarantineCreate, db: DbSession) -> QuarantineEntry:
+    """Stop a flaky test's failures from failing runs, until it's released."""
+    _get_or_404(db, project_id)
+    try:
+        entry_id = quarantine_test(db, project_id, payload.classname, payload.name, payload.reason)
+    except NotFlaky:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "no evidence this test is flaky: it has never both passed and failed on one "
+            "commit. A test that fails every time is broken, and needs fixing, not quarantine.",
+        ) from None
+    except AlreadyQuarantined:
+        raise HTTPException(status.HTTP_409_CONFLICT, "this test is already quarantined") from None
+    return next(entry for entry in list_quarantine(db, project_id) if entry.id == entry_id)
+
+
+@router.delete("/{project_id}/quarantine/{entry_id}", status_code=status.HTTP_204_NO_CONTENT)
+def release(project_id: int, entry_id: int, db: DbSession) -> None:
+    """Take a test out of quarantine: from the next run on, its failures count again."""
+    _get_or_404(db, project_id)
+    if not release_test(db, project_id, entry_id):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "no such test in this project's quarantine")

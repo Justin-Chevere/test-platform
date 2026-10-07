@@ -1,7 +1,7 @@
 import enum
 from datetime import UTC, datetime
 
-from sqlalchemy import DateTime, Enum, ForeignKey, Index, String, Text
+from sqlalchemy import DateTime, Enum, ForeignKey, Index, String, Text, UniqueConstraint, false
 from sqlalchemy.engine import Dialect
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.types import TypeDecorator
@@ -13,7 +13,9 @@ from app.runner import Outcome
 class RunStatus(enum.StrEnum):
     QUEUED = "queued"  # waiting for a worker, or for another one if its worker died
     RUNNING = "running"
-    PASSED = "passed"  # the test command succeeded and no test failed
+    # The test command succeeded and no test failed, or every failure was in a quarantined
+    # test (see app/quarantine.py).
+    PASSED = "passed"
     FAILED = "failed"  # the tests ran, and one failed or the test command exited non-zero
     ERROR = "error"  # the tests couldn't run or report: a bad ref, a failed setup, a timeout
 
@@ -102,6 +104,8 @@ class Run(Base):
     tests_failed: Mapped[int] = mapped_column(default=0)
     tests_errored: Mapped[int] = mapped_column(default=0)
     tests_skipped: Mapped[int] = mapped_column(default=0)
+    # Of the failed and errored tests, how many didn't count: they were quarantined.
+    tests_quarantined: Mapped[int] = mapped_column(default=0, server_default="0")
     # Deferred: only loaded when read, so listing runs never drags their logs along.
     log: Mapped[str] = mapped_column(Text, default="", deferred=True)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=_now)
@@ -123,3 +127,20 @@ class TestResult(Base):
     outcome: Mapped[Outcome] = mapped_column(_enum_column(Outcome))
     duration_seconds: Mapped[float]
     message: Mapped[str | None] = mapped_column(Text)
+    # The test was quarantined when this run was saved, so a failure here didn't fail it.
+    quarantined: Mapped[bool] = mapped_column(default=False, server_default=false())
+
+
+class QuarantinedTest(Base):
+    """A flaky test whose failures don't fail runs while someone fixes it."""
+
+    __tablename__ = "quarantined_tests"
+    # Also serves as the index for a project's quarantine list: project_id comes first.
+    __table_args__ = (UniqueConstraint("project_id", "classname", "name"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"))
+    classname: Mapped[str] = mapped_column(Text)
+    name: Mapped[str] = mapped_column(Text)
+    reason: Mapped[str] = mapped_column(Text)  # why, and who is fixing it
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=_now)

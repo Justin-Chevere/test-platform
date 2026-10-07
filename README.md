@@ -20,6 +20,8 @@ seconds.
       worker that was presumed dead can't overwrite its replacement (fencing)
 - [x] Flaky test detection: tests that both passed and failed on the same commit, with the evidence,
       found by automatically rerunning failed runs
+- [x] Quarantine: a flaky test's failures stop failing runs, by deliberate choice and with a reason,
+      while real failures still fail them
 - [x] Schema migrations (Alembic), checked against the models by a test
 - [x] Local runner: a fresh checkout and virtualenv for every run, a time limit, and no process
       left running afterwards
@@ -28,13 +30,11 @@ seconds.
 
 ## Next steps
 
-1. **Quarantine:** let a run pass when its only failures are tests already known to be flaky,
-   while still reporting them.
-2. **Trends:** slowest tests, failure rates, and how both change over time.
-3. **Docker runner:** run each job in a throwaway container, so untrusted code can't touch the
+1. **Trends:** slowest tests, failure rates, and how both change over time.
+2. **Docker runner:** run each job in a throwaway container, so untrusted code can't touch the
    machine.
-4. **GitHub integration:** start runs from push webhooks, and report pass or fail on each commit.
-5. **Logins**, then a web dashboard.
+3. **GitHub integration:** start runs from push webhooks, and report pass or fail on each commit.
+4. **Logins**, then a web dashboard.
 
 ## How it works
 
@@ -108,7 +108,7 @@ Known limits:
 |--------|---------|
 | `queued` | Waiting for a worker, or for another one if its worker died |
 | `running` | A worker has it, and keeps sending heartbeats |
-| `passed` | The test command exited with 0 **and** the report shows no failed or errored test |
+| `passed` | The test command exited with 0 **and** the report shows no failed or errored test, or every failed or errored test is quarantined |
 | `failed` | The tests ran: at least one failed, or the test command exited non-zero |
 | `error` | The tests couldn't run or report: unknown branch, failed setup, time limit, no report, or every worker that tried it died |
 
@@ -162,6 +162,32 @@ Tried for real, with a test that depends on a file left behind by an earlier run
 failed, the worker queued that commit again, the rerun passed, and the test was reported as flaky
 with both runs as evidence.
 
+### Quarantine
+
+A quarantined test is a flaky test whose failures don't fail runs while someone fixes it.
+
+- **A deliberate decision, never automatic.** `POST /projects/{id}/quarantine` takes the test and
+  a reason: why, and who is fixing it. Quarantining every test that ever flaked would hide any real
+  bug in those tests for good.
+- **Evidence required.** Only a test that has both passed and failed on one commit can be
+  quarantined. A test that fails every time is broken, and quarantine must not become a way to
+  mute it.
+- **All or nothing, per run.** A run passes only if *every* failed or errored test in it is
+  quarantined. One real failure still fails it, and earns its automatic rerun. The exit code is
+  ignored in that one case, because the test tool exits non-zero precisely because the quarantined
+  tests failed. The trade-off: if something else also failed the command in that same run (a
+  coverage threshold, say), it would go unnoticed.
+- **Nothing hidden.** The failures stay in the run's results, marked `"quarantined": true`, and
+  each run counts them in `tests_quarantined`.
+- **Decided when a run is saved.** Quarantining or releasing a test changes future runs, never past
+  ones: a run's verdict is history.
+- **Built to be released.** `GET /projects/{id}/quarantine` shows how each test has done since it
+  went in ("2 failures in 3 runs"), and `DELETE /projects/{id}/quarantine/{id}` releases it.
+
+Tried for real: quarantining a test that had never failed was refused. Once the flaky test was
+quarantined, its next failure left the run passed; when a real bug landed next to it, the run
+failed anyway.
+
 ## Security: trusted repositories only, for now
 
 The local runner keeps runs apart from **each other**, not from **your machine**: the tests run
@@ -212,6 +238,8 @@ Then open http://127.0.0.1:8000/docs and try:
    failures, and `GET /runs/1/log` returns every command and its output.
 4. `POST /runs/1/rerun` tests the same commit again, and `GET /projects/1/flaky-tests` lists any
    test that has both passed and failed on one commit.
+5. `POST /projects/1/quarantine` with `{"classname": ..., "name": ..., "reason": ...}` stops a
+   flaky test's failures from failing runs; `GET /projects/1/quarantine` lists the quarantine.
 
 `python -m app.worker --once` runs everything queued and exits, which is handy for scripts.
 
@@ -256,10 +284,11 @@ the migrations alone, compare it with the models, and undo and redo every migrat
 | `app/run_queue.py` | Claims runs atomically, renews leases, recovers abandoned runs |
 | `app/worker.py` | Worker loop: recover, claim, execute with heartbeats, save the outcome if still held, rerun failures |
 | `app/flaky.py` | Finds flaky tests: passed and failed on the same commit |
+| `app/quarantine.py` | Quarantine rules: evidence required, per-test history since quarantined |
 | `app/migrate.py` | Applies migrations from code; the startup schema check |
 | `migrations/` | Alembic migrations, one file per schema change |
 | `app/runner/base.py` | The `Runner` interface and the data passed in and out of it |
 | `app/runner/local.py` | Runs a job on this machine: checkout, virtualenv, commands, cleanup |
 | `app/runner/junit.py` | Reads JUnit XML reports |
 | `app/main.py` | Application factory |
-| `tests/` | API, queue, worker, flaky and migration tests on a fresh database file each; runner tests end to end |
+| `tests/` | API, queue, worker, flaky, quarantine and migration tests on a fresh database file each; runner tests end to end |
