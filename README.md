@@ -22,6 +22,8 @@ seconds.
       found by automatically rerunning failed runs
 - [x] Quarantine: a flaky test's failures stop failing runs, by deliberate choice and with a reason,
       while real failures still fail them
+- [x] Trends: the slowest and most-failing tests, each next to the same numbers from the runs
+      before, and a daily summary of runs, pass rate and run time
 - [x] Schema migrations (Alembic), checked against the models by a test
 - [x] Local runner: a fresh checkout and virtualenv for every run, a time limit, and no process
       left running afterwards
@@ -30,11 +32,10 @@ seconds.
 
 ## Next steps
 
-1. **Trends:** slowest tests, failure rates, and how both change over time.
-2. **Docker runner:** run each job in a throwaway container, so untrusted code can't touch the
+1. **Docker runner:** run each job in a throwaway container, so untrusted code can't touch the
    machine.
-3. **GitHub integration:** start runs from push webhooks, and report pass or fail on each commit.
-4. **Logins**, then a web dashboard.
+2. **GitHub integration:** start runs from push webhooks, and report pass or fail on each commit.
+3. **Logins**, then a web dashboard.
 
 ## How it works
 
@@ -188,6 +189,36 @@ Tried for real: quarantining a test that had never failed was refused. Once the 
 quarantined, its next failure left the run passed; when a real bug landed next to it, the run
 failed anyway.
 
+### Trends
+
+Three questions, one endpoint each:
+
+| Question | Endpoint | Answer |
+|----------|----------|--------|
+| Which tests slow the suite down? | `GET /projects/{id}/trends/slowest-tests` | Each test's median and p95 duration over the last N runs |
+| Which tests fail most? | `GET /projects/{id}/trends/failing-tests` | Each test's failure rate over the last N runs |
+| Is the suite getting healthier? | `GET /projects/{id}/trends/daily` | Per UTC day: runs, pass rate and median run time |
+
+- **Windows count runs, not days** (`?runs=50` by default), so a quiet project and a busy one
+  both get enough data points. "Recent" means most recently *finished*.
+- **Each test's numbers come with the same numbers for the window before.** That's what makes it
+  a trend: a median that went from 0.1 s to 1 s is a performance regression, visible in one line.
+- **Median and p95, not the mean.** A single 9-second outlier drags the mean to a time the test
+  never actually took. The median says what's typical, and p95 shows the bad days. It's the
+  nearest-rank p95, so it's always a time that really happened.
+- A skipped test didn't run, so it counts as neither a run nor a duration; an error counts as a
+  failure.
+- The daily summary has an entry for every day in the range, empty ones included, so a chart has
+  no gaps to paper over.
+- Computed when asked, in Python: medians and percentiles have no portable SQL (Postgres has
+  `percentile_cont`, SQLite nothing), and a few hundred runs' worth of results is small. At a much
+  larger scale, per-test daily totals would be kept up to date as results arrive instead.
+
+Tried for real: over three runs of cloud-resource-manager's suite, its slowest tests were the
+login rate-limit tests, at about 0.19 s median each. And when a commit made one test ten times
+slower and broke another, the trends showed both in one line each: "median 1.001 s now, 0.101 s
+before" and "failure rate 1.0 now, 0.0 before".
+
 ## Security: trusted repositories only, for now
 
 The local runner keeps runs apart from **each other**, not from **your machine**: the tests run
@@ -240,6 +271,8 @@ Then open http://127.0.0.1:8000/docs and try:
    test that has both passed and failed on one commit.
 5. `POST /projects/1/quarantine` with `{"classname": ..., "name": ..., "reason": ...}` stops a
    flaky test's failures from failing runs; `GET /projects/1/quarantine` lists the quarantine.
+6. `GET /projects/1/trends/slowest-tests`, `.../failing-tests` and `.../daily` show where the
+   suite spends its time, what keeps failing, and which way both are heading.
 
 `python -m app.worker --once` runs everything queued and exits, which is handy for scripts.
 
@@ -280,15 +313,16 @@ the migrations alone, compare it with the models, and undo and redo every migrat
 | `app/db.py` | Engine (SQLite in WAL mode), session factory, per-request session dependency |
 | `app/models.py` | Database tables: projects, runs, test results |
 | `app/schemas.py` | Request and response shapes, validation |
-| `app/routers/` | HTTP endpoints: health, projects, runs |
+| `app/routers/` | HTTP endpoints: health, projects, runs, trends |
 | `app/run_queue.py` | Claims runs atomically, renews leases, recovers abandoned runs |
 | `app/worker.py` | Worker loop: recover, claim, execute with heartbeats, save the outcome if still held, rerun failures |
 | `app/flaky.py` | Finds flaky tests: passed and failed on the same commit |
 | `app/quarantine.py` | Quarantine rules: evidence required, per-test history since quarantined |
+| `app/trends.py` | Slowest and most-failing tests against the window before, daily summaries |
 | `app/migrate.py` | Applies migrations from code; the startup schema check |
 | `migrations/` | Alembic migrations, one file per schema change |
 | `app/runner/base.py` | The `Runner` interface and the data passed in and out of it |
 | `app/runner/local.py` | Runs a job on this machine: checkout, virtualenv, commands, cleanup |
 | `app/runner/junit.py` | Reads JUnit XML reports |
 | `app/main.py` | Application factory |
-| `tests/` | API, queue, worker, flaky, quarantine and migration tests on a fresh database file each; runner tests end to end |
+| `tests/` | API, queue, worker, flaky, quarantine, trends and migration tests on a fresh database file each; runner tests end to end |

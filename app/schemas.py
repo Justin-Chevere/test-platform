@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import PurePosixPath, PureWindowsPath
 from typing import Annotated
 
@@ -139,3 +139,34 @@ class QuarantinedTestOut(BaseModel):
     created_at: datetime
     runs_since: int  # runs since it went into quarantine that included the test...
     failures_since: int  # ...and how many of those it failed or errored in
+
+
+class TrendWindowOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    runs: int  # runs that ran the test
+    failures: int  # ...in which it failed or errored
+    failure_rate: float
+    median_seconds: float  # how long it typically takes
+    p95_seconds: float  # how long it takes on a bad day: 1 run in 20 is slower
+
+
+class TestTrendOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    classname: str
+    name: str
+    recent: TrendWindowOut  # the last N runs
+    previous: TrendWindowOut | None  # the N runs before those; None if it didn't run then
+
+
+class DaySummaryOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    day: date  # a UTC day
+    runs: int
+    passed: int
+    failed: int
+    errors: int
+    pass_rate: float | None  # None on a day without runs
+    median_duration_seconds: float | None

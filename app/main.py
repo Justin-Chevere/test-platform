@@ -8,7 +8,7 @@ from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from app.config import get_settings
 from app.db import engine
 from app.migrate import check_schema
-from app.routers import health, projects, runs
+from app.routers import health, projects, runs, trends
 
 
 @asynccontextmanager
@@ -30,6 +30,7 @@ def create_app() -> FastAPI:
     app.include_router(health.router)
     app.include_router(projects.router)
     app.include_router(runs.router)
+    app.include_router(trends.router)
     return app
 
 
