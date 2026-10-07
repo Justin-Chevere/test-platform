@@ -25,6 +25,9 @@ class ProjectCreate(BaseModel):
     report_path: str = Field(default="test-report.xml", min_length=1, max_length=255)
     # For the setup and test commands together.
     timeout_seconds: int = Field(default=600, ge=10, le=3600)
+    # When a run fails, test the same commit again up to this many times, to tell flaky
+    # tests from broken ones. 0 turns it off.
+    auto_reruns: int = Field(default=1, ge=0, le=3)
 
     @field_validator("report_path")
     @classmethod
@@ -48,6 +51,7 @@ class ProjectOut(BaseModel):
     test_command: str
     report_path: str
     timeout_seconds: int
+    auto_reruns: int
     created_at: datetime
 
 
@@ -62,6 +66,7 @@ class RunOut(BaseModel):
     project_id: int
     ref: str
     commit_sha: str | None
+    rerun_of_id: int | None  # set when this run tests the same commit as an earlier one
     status: RunStatus
     worker_id: str | None
     attempt: int
@@ -92,3 +97,24 @@ class TestResultOut(BaseModel):
     outcome: Outcome
     duration_seconds: float
     message: str | None
+    # It has both passed and failed on one commit in this project, so a failure here may
+    # be the test's fault rather than the code's.
+    flaky: bool = False
+
+
+class FlakyEvidenceOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    commit_sha: str
+    failed_run_id: int
+    passed_run_id: int
+
+
+class FlakyTestOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    classname: str
+    name: str
+    flaky_commits: int  # how many commits it has both passed and failed on
+    last_flaked_at: datetime
+    latest: FlakyEvidenceOut  # from the most recent of those commits

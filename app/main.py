@@ -5,17 +5,18 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 
-from app import models  # noqa: F401  (registers the tables on Base.metadata)
 from app.config import get_settings
-from app.db import Base, engine
+from app.db import engine
+from app.migrate import check_schema
 from app.routers import health, projects, runs
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     logging.basicConfig(level=logging.INFO)
-    # Fine while the schema is tiny. Replace with Alembic migrations later.
-    Base.metadata.create_all(engine)
+    # Refuse to start on an outdated schema, rather than fail later on the first request
+    # that touches a missing column. Migrating is its own step: `alembic upgrade head`.
+    check_schema(engine)
     yield
 
 

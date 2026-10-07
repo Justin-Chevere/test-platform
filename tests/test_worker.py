@@ -6,6 +6,7 @@ import pytest
 from sqlalchemy import select
 
 from app.config import Settings
+from app.flaky import find_flaky_tests
 from app.models import Run, RunStatus, TestResult
 from app.run_queue import claim_next_run, recover_abandoned_runs
 from app.runner import CaseResult, Outcome, RunResult, RunSpec
@@ -16,21 +17,26 @@ FAILED = CaseResult("tests.test_a", "test_bad", Outcome.FAILED, 0.2, "assert 1 =
 ERRORED = CaseResult("tests.test_b", "test_crash", Outcome.ERROR, 0.0, "boom")
 SKIPPED = CaseResult("tests.test_b", "test_later", Outcome.SKIPPED, 0.0, "not ready")
 
+COMMIT = "c" * 40
+PASSING = RunResult(commit_sha=COMMIT, exit_code=0, cases=(PASSED,))
+FAILING = RunResult(commit_sha=COMMIT, exit_code=1, cases=(PASSED, FAILED))
+
 
 class FakeRunner:
-    """Returns a canned result, or raises, and remembers what it was asked to run.
+    """Returns canned results in order, repeating the last one, or raises. Remembers what
+    it was asked to run.
 
-    `while_running` is called in the middle of the run, to act out whatever else
+    `while_running` is called in the middle of each run, to act out whatever else
     happens in the meantime.
     """
 
     def __init__(
         self,
-        result: RunResult | None = None,
+        *results: RunResult,
         raises: BaseException | None = None,
         while_running=None,
     ) -> None:
-        self.result = result or RunResult(commit_sha="c" * 40, exit_code=0, cases=(PASSED,))
+        self.results = list(results) or [PASSING]
         self.raises = raises
         self.while_running = while_running
         self.specs: list[RunSpec] = []
@@ -41,12 +47,17 @@ class FakeRunner:
             self.while_running()
         if self.raises is not None:
             raise self.raises
-        return self.result
+        return self.results.pop(0) if len(self.results) > 1 else self.results[0]
 
 
 def _get(session_factory, run_id) -> Run:
     with session_factory() as db:
         return db.get_one(Run, run_id)
+
+
+def _all_runs(session_factory) -> list[Run]:
+    with session_factory() as db:
+        return list(db.scalars(select(Run).order_by(Run.id)))
 
 
 def _claim(session_factory, worker_id="w1"):
@@ -56,6 +67,10 @@ def _claim(session_factory, worker_id="w1"):
 
 def _execute(session_factory, claim, runner, heartbeat_seconds=60.0) -> bool:
     return execute_run(session_factory, claim, runner, heartbeat_seconds=heartbeat_seconds)
+
+
+def _work_through_the_queue(session_factory, runner) -> None:
+    run_worker(session_factory, runner, Settings(worker_poll_seconds=0.01), once=True)
 
 
 @pytest.mark.parametrize(
@@ -78,7 +93,7 @@ def test_execute_run_saves_the_outcome_and_every_test(session_factory, make_proj
     project = make_project(setup_command="pip install -r requirements.txt", timeout_seconds=120)
     run_id = queue_run(project, ref="feature/x")
     cases = (PASSED, FAILED, ERRORED, SKIPPED)
-    runner = FakeRunner(RunResult(commit_sha="c" * 40, exit_code=1, cases=cases, log="the log"))
+    runner = FakeRunner(RunResult(commit_sha=COMMIT, exit_code=1, cases=cases, log="the log"))
 
     assert _execute(session_factory, _claim(session_factory), runner) is True
 
@@ -95,7 +110,7 @@ def test_execute_run_saves_the_outcome_and_every_test(session_factory, make_proj
     with session_factory() as db:
         run = db.get_one(Run, run_id)
         assert run.status == RunStatus.FAILED
-        assert run.commit_sha == "c" * 40
+        assert run.commit_sha == COMMIT
         assert run.exit_code == 1
         assert (run.tests_passed, run.tests_failed, run.tests_errored, run.tests_skipped) == (
             1,
@@ -146,13 +161,15 @@ def test_a_result_from_a_replaced_worker_is_thrown_away(session_factory, make_pr
             recover_abandoned_runs(db, lease_seconds=60, max_attempts=3)
             claim_next_run(db, "w2")
 
-    saved = _execute(session_factory, claim, FakeRunner(while_running=replaced_meanwhile))
+    runner = FakeRunner(FAILING, while_running=replaced_meanwhile)
 
-    assert saved is False
+    assert _execute(session_factory, claim, runner) is False
+
     run = _get(session_factory, run_id)
     assert (run.status, run.worker_id, run.attempt) == (RunStatus.RUNNING, "w2", 2)
     with session_factory() as db:
         assert db.scalars(select(TestResult).where(TestResult.run_id == run_id)).all() == []
+    assert len(_all_runs(session_factory)) == 1  # and its failure queued no rerun
 
 
 def _long_run(session_factory, checks: list[int]):
@@ -196,6 +213,68 @@ def test_without_heartbeats_a_long_run_is_presumed_dead(session_factory, make_pr
     assert _get(session_factory, run_id).status == RunStatus.QUEUED  # waiting for attempt 2
 
 
+def test_a_failed_run_queues_a_rerun_of_its_commit(session_factory, make_project, queue_run):
+    run_id = queue_run(make_project(), ref="main")
+
+    _execute(session_factory, _claim(session_factory), FakeRunner(FAILING))
+
+    first, rerun = _all_runs(session_factory)
+    assert first.id == run_id
+    # The exact commit that failed, not the branch, which may have moved on since.
+    assert (rerun.status, rerun.ref, rerun.rerun_of_id) == (RunStatus.QUEUED, COMMIT, run_id)
+
+
+@pytest.mark.parametrize(
+    "result",
+    [PASSING, RunResult(commit_sha=COMMIT, error="the setup command exited with code 1")],
+    ids=["passed", "error"],
+)
+def test_only_failed_runs_are_rerun(session_factory, make_project, queue_run, result):
+    queue_run(make_project())
+
+    _execute(session_factory, _claim(session_factory), FakeRunner(result))
+
+    assert len(_all_runs(session_factory)) == 1
+
+
+def test_auto_reruns_can_be_turned_off(session_factory, make_project, queue_run):
+    queue_run(make_project(auto_reruns=0))
+
+    _execute(session_factory, _claim(session_factory), FakeRunner(FAILING))
+
+    assert len(_all_runs(session_factory)) == 1
+
+
+def test_reruns_stop_at_the_projects_limit(session_factory, make_project, queue_run):
+    queue_run(make_project(auto_reruns=2), ref="main")
+    runner = FakeRunner(FAILING)  # fails every time
+
+    _work_through_the_queue(session_factory, runner)
+
+    first, *reruns = _all_runs(session_factory)
+    assert [run.status for run in (first, *reruns)] == [RunStatus.FAILED] * 3
+    assert [run.rerun_of_id for run in reruns] == [first.id, first.id]
+    assert [spec.ref for spec in runner.specs] == ["main", COMMIT, COMMIT]
+
+
+def test_a_test_that_fails_and_then_passes_its_rerun_is_flaky(
+    session_factory, make_project, queue_run
+):
+    project = make_project()
+    queue_run(project)
+    passes_this_time = CaseResult("tests.test_a", "test_bad", Outcome.PASSED, 0.2)
+    rerun_result = RunResult(commit_sha=COMMIT, exit_code=0, cases=(PASSED, passes_this_time))
+
+    _work_through_the_queue(session_factory, FakeRunner(FAILING, rerun_result))
+
+    first, rerun = _all_runs(session_factory)
+    assert (first.status, rerun.status) == (RunStatus.FAILED, RunStatus.PASSED)
+    with session_factory() as db:
+        (flaky,) = find_flaky_tests(db, project.id)
+    assert flaky.name == "test_bad"
+    assert (flaky.latest.failed_run_id, flaky.latest.passed_run_id) == (first.id, rerun.id)
+
+
 def test_worker_recovers_abandoned_runs_before_claiming(session_factory, make_project, queue_run):
     run_id = queue_run(make_project())
     _claim(session_factory, "dead-worker")
@@ -203,7 +282,7 @@ def test_worker_recovers_abandoned_runs_before_claiming(session_factory, make_pr
         db.get_one(Run, run_id).heartbeat_at = datetime.now(UTC) - timedelta(minutes=5)
         db.commit()
 
-    run_worker(session_factory, FakeRunner(), Settings(worker_poll_seconds=0.01), once=True)
+    _work_through_the_queue(session_factory, FakeRunner())
 
     run = _get(session_factory, run_id)
     assert (run.status, run.attempt) == (RunStatus.PASSED, 2)
@@ -217,7 +296,7 @@ def test_worker_runs_everything_queued_then_exits_when_told_once(
     run_ids = [queue_run(project) for _ in range(3)]
     runner = FakeRunner()
 
-    run_worker(session_factory, runner, Settings(worker_poll_seconds=0.01), once=True)
+    _work_through_the_queue(session_factory, runner)
 
     assert len(runner.specs) == 3
     assert [_get(session_factory, run_id).status for run_id in run_ids] == [RunStatus.PASSED] * 3

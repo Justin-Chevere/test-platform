@@ -18,6 +18,9 @@ seconds.
 - [x] Run queue stored in the database, safe with any number of workers
 - [x] Crash recovery: a dead worker's run goes back to the queue (heartbeats and leases), and a
       worker that was presumed dead can't overwrite its replacement (fencing)
+- [x] Flaky test detection: tests that both passed and failed on the same commit, with the evidence,
+      found by automatically rerunning failed runs
+- [x] Schema migrations (Alembic), checked against the models by a test
 - [x] Local runner: a fresh checkout and virtualenv for every run, a time limit, and no process
       left running afterwards
 - [x] JUnit XML reports, so any test tool that writes them works (pytest, Jest, Go, Maven...)
@@ -25,7 +28,8 @@ seconds.
 
 ## Next steps
 
-1. **Flaky test detection:** flag tests that both pass and fail on the same commit.
+1. **Quarantine:** let a run pass when its only failures are tests already known to be flaky,
+   while still reporting them.
 2. **Trends:** slowest tests, failure rates, and how both change over time.
 3. **Docker runner:** run each job in a throwaway container, so untrusted code can't touch the
    machine.
@@ -134,6 +138,30 @@ Reports are JUnit XML, the format nearly every test tool can write and Jenkins a
 The report is written by the code under test, so it's parsed with `defusedxml`, which refuses XML
 tricks like the "billion laughs" entity bomb (a few hundred bytes that expand to gigabytes).
 
+### Flaky tests
+
+A test is flaky when it both passed and failed **on the same commit**: same code, different
+result, so the test itself is unreliable (timing, randomness, test order, state left behind by an
+earlier run). Failing on one commit and passing on the next doesn't count: that's a fix.
+
+- **Reruns gather the evidence.** When a run fails, the worker queues the same commit again (once
+  by default; each project chooses 0 to 3), in the same transaction that saves the failure.
+  `POST /runs/{id}/rerun` does the same on request. A rerun tests the exact commit, not the
+  branch, which may have moved on since.
+- **One query finds them.** It groups every test result by test and commit, and keeps the groups
+  with at least one pass and at least one failure or error (a skip counts as neither). The
+  database does the filtering, so only flaky pairs come back. The answer is computed when asked
+  rather than stored, so it's never out of date; at a much larger scale, per-commit counts would be
+  kept up to date as results arrive instead.
+- **Where it shows:** `GET /projects/{id}/flaky-tests` lists each flaky test with how many commits
+  it flaked on and the latest evidence: the commit, a run that failed it and a run that passed it.
+  In `GET /runs/{id}/tests`, a test that has flaked before carries `"flaky": true`, so its failure
+  reads as "probably the usual flake" rather than "the code is broken".
+
+Tried for real, with a test that depends on a file left behind by an earlier run: the first run
+failed, the worker queued that commit again, the rerun passed, and the test was reported as flaky
+with both runs as evidence.
+
 ## Security: trusted repositories only, for now
 
 The local runner keeps runs apart from **each other**, not from **your machine**: the tests run
@@ -158,10 +186,14 @@ Requires Python 3.12+ and Git.
 python -m venv .venv
 .venv\Scripts\activate        # Windows
 pip install -e ".[dev]"
+alembic upgrade head             # create the database, or bring it up to date
 
 uvicorn app.main:app --reload    # terminal 1: the API
 python -m app.worker             # terminal 2: a worker (start more for parallel runs)
 ```
+
+After pulling changes, run `alembic upgrade head` again. The API and workers refuse to start on an
+outdated schema, and say which command fixes it.
 
 Then open http://127.0.0.1:8000/docs and try:
 
@@ -178,10 +210,26 @@ Then open http://127.0.0.1:8000/docs and try:
    something other than the default branch.
 3. `GET /runs/1` shows the status and counts, `GET /runs/1/tests?outcome=failed` lists the
    failures, and `GET /runs/1/log` returns every command and its output.
+4. `POST /runs/1/rerun` tests the same commit again, and `GET /projects/1/flaky-tests` lists any
+   test that has both passed and failed on one commit.
 
 `python -m app.worker --once` runs everything queued and exits, which is handy for scripts.
 
 Settings come from environment variables or a `.env` file (see `.env.example`).
+
+## Changing the schema
+
+Every schema change is an Alembic migration in `migrations/versions/`:
+
+1. Change the models in `app/models.py`.
+2. `alembic revision --autogenerate -m "what changed"` writes a migration from the difference,
+   formatted and linted. Read it before trusting it.
+3. `alembic upgrade head` applies it.
+
+Migrations are their own step, never a side effect of starting the API or a worker: processes
+starting at the same moment would race to migrate the same database. Instead, each one checks the
+schema on startup. A test builds a database from the migrations alone and fails if it differs from
+the models in any way, so a model changed without a migration can't slip through.
 
 ## Test
 
@@ -193,7 +241,8 @@ ruff check .
 The runner tests use real git repositories, virtualenvs and processes, including a test that
 starts a process tree, lets it hit the time limit, and checks that no child process survived. The
 worker tests let a run outlast its lease with heartbeats and without, and replace a worker in the
-middle of a run to check its late result is thrown away.
+middle of a run to check its late result is thrown away. The migration tests build a database from
+the migrations alone, compare it with the models, and undo and redo every migration.
 
 ## Layout
 
@@ -205,9 +254,12 @@ middle of a run to check its late result is thrown away.
 | `app/schemas.py` | Request and response shapes, validation |
 | `app/routers/` | HTTP endpoints: health, projects, runs |
 | `app/run_queue.py` | Claims runs atomically, renews leases, recovers abandoned runs |
-| `app/worker.py` | Worker loop: recover, claim, execute with heartbeats, save the outcome if still held |
+| `app/worker.py` | Worker loop: recover, claim, execute with heartbeats, save the outcome if still held, rerun failures |
+| `app/flaky.py` | Finds flaky tests: passed and failed on the same commit |
+| `app/migrate.py` | Applies migrations from code; the startup schema check |
+| `migrations/` | Alembic migrations, one file per schema change |
 | `app/runner/base.py` | The `Runner` interface and the data passed in and out of it |
 | `app/runner/local.py` | Runs a job on this machine: checkout, virtualenv, commands, cleanup |
 | `app/runner/junit.py` | Reads JUnit XML reports |
 | `app/main.py` | Application factory |
-| `tests/` | API, queue and worker tests on an in-memory database; runner tests end to end |
+| `tests/` | API, queue, worker, flaky and migration tests on a fresh database file each; runner tests end to end |

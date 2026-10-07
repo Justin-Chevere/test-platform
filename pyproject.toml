@@ -7,6 +7,7 @@ dependencies = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.30",
     "sqlalchemy>=2.0",
+    "alembic>=1.16",  # 1.16 reads its settings from this file
     "pydantic-settings>=2.4",
     "defusedxml>=0.7",
 ]
@@ -34,3 +35,22 @@ target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
+
+[tool.alembic]
+script_location = "%(here)s/migrations"
+# Dated file names, so migrations list in the order they were written.
+file_template = "%%(year)d_%%(month).2d_%%(day).2d-%%(rev)s_%%(slug)s"
+prepend_sys_path = ["."]
+
+# New migrations come out formatted and lint-clean.
+[[tool.alembic.post_write_hooks]]
+name = "ruff_format"
+type = "module"
+module = "ruff"
+options = "format --quiet REVISION_SCRIPT_FILENAME"
+
+[[tool.alembic.post_write_hooks]]
+name = "ruff_check"
+type = "module"
+module = "ruff"
+options = "check --fix --quiet REVISION_SCRIPT_FILENAME"

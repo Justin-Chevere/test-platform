@@ -67,6 +67,9 @@ class Project(Base):
     test_command: Mapped[str] = mapped_column(String(1000))
     report_path: Mapped[str] = mapped_column(String(255))
     timeout_seconds: Mapped[int]
+    # When a run fails, test the same commit again, up to this many times: a test that
+    # fails and then passes is flaky rather than broken (see app/flaky.py).
+    auto_reruns: Mapped[int] = mapped_column(default=1, server_default="1")
     created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=_now)
 
 
@@ -83,6 +86,9 @@ class Run(Base):
     ref: Mapped[str] = mapped_column(String(255))  # what was asked for: a branch, tag or commit
     # What was actually tested. 40 characters for SHA-1, 64 for SHA-256 repositories.
     commit_sha: Mapped[str | None] = mapped_column(String(64))
+    # Set on a run that tests the same commit as an earlier one: the first run of that
+    # commit, which every rerun points to, whether it was asked for or automatic.
+    rerun_of_id: Mapped[int | None] = mapped_column(ForeignKey("runs.id"), index=True)
     status: Mapped[RunStatus] = mapped_column(_enum_column(RunStatus), default=RunStatus.QUEUED)
     worker_id: Mapped[str | None] = mapped_column(String(255))
     # How many times a worker has claimed this run: more than once if a worker died

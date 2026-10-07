@@ -1,4 +1,9 @@
+from datetime import UTC, datetime
+
 import pytest
+
+from app.models import Run, RunStatus, TestResult
+from app.runner import Outcome
 
 NEW_PROJECT = {"name": "demo", "repo_url": "https://github.com/example/demo"}
 
@@ -13,6 +18,7 @@ def test_create_project_fills_in_defaults(client):
     assert body["test_command"] == "python -m pytest --junitxml=test-report.xml"
     assert body["report_path"] == "test-report.xml"
     assert body["timeout_seconds"] == 600
+    assert body["auto_reruns"] == 1
     assert body["created_at"].endswith("Z")  # UTC, never ambiguous local time
 
 
@@ -42,6 +48,13 @@ def test_only_https_repositories_are_accepted(client, repo_url):
 @pytest.mark.parametrize("report_path", ["../outside.xml", "/etc/passwd", "C:\\report.xml"])
 def test_report_path_must_stay_inside_the_repository(client, report_path):
     response = client.post("/projects", json=NEW_PROJECT | {"report_path": report_path})
+
+    assert response.status_code == 422
+
+
+@pytest.mark.parametrize("auto_reruns", [-1, 4])
+def test_auto_reruns_stay_between_zero_and_three(client, auto_reruns):
+    response = client.post("/projects", json=NEW_PROJECT | {"auto_reruns": auto_reruns})
 
     assert response.status_code == 422
 
@@ -104,3 +117,42 @@ def test_list_runs_newest_first(client):
 
     assert [r["id"] for r in runs] == [second["id"], first["id"]]
     assert client.get(f"/projects/{project['id']}/runs?limit=1").json()[0]["id"] == second["id"]
+
+
+def test_list_flaky_tests(client, make_project, session_factory):
+    project = make_project()
+    with session_factory() as db:
+        for outcome in (Outcome.FAILED, Outcome.PASSED):
+            run = Run(
+                project_id=project.id,
+                ref="main",
+                commit_sha="a" * 40,
+                status=RunStatus.PASSED,
+                finished_at=datetime(2026, 10, 6, 12, 0, tzinfo=UTC),
+            )
+            db.add(run)
+            db.flush()
+            db.add(
+                TestResult(
+                    run_id=run.id,
+                    classname="tests.test_api",
+                    name="test_timing",
+                    outcome=outcome,
+                    duration_seconds=0.1,
+                )
+            )
+        db.commit()
+
+    response = client.get(f"/projects/{project.id}/flaky-tests")
+
+    assert response.status_code == 200
+    assert response.json() == [
+        {
+            "classname": "tests.test_api",
+            "name": "test_timing",
+            "flaky_commits": 1,
+            "last_flaked_at": "2026-10-06T12:00:00Z",
+            "latest": {"commit_sha": "a" * 40, "failed_run_id": 1, "passed_run_id": 2},
+        }
+    ]
+    assert client.get("/projects/999/flaky-tests").status_code == 404

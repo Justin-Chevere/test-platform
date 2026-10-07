@@ -6,8 +6,9 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.db import DbSession
+from app.flaky import FlakyTest, find_flaky_tests
 from app.models import Project, Run
-from app.schemas import ProjectCreate, ProjectOut, RunCreate, RunOut
+from app.schemas import FlakyTestOut, ProjectCreate, ProjectOut, RunCreate, RunOut
 
 router = APIRouter(prefix="/projects", tags=["projects"])
 
@@ -62,3 +63,10 @@ def list_runs(
     _get_or_404(db, project_id)
     query = select(Run).where(Run.project_id == project_id).order_by(Run.id.desc()).limit(limit)
     return list(db.scalars(query))
+
+
+@router.get("/{project_id}/flaky-tests", response_model=list[FlakyTestOut])
+def list_flaky_tests(project_id: int, db: DbSession) -> list[FlakyTest]:
+    """Tests that both passed and failed on the same commit, most recently flaky first."""
+    _get_or_404(db, project_id)
+    return find_flaky_tests(db, project_id)

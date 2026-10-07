@@ -76,8 +76,74 @@ def test_filter_test_results_by_outcome(client, finished_run):
             "outcome": "failed",
             "duration_seconds": 0.2,
             "message": "assert 1 == 2",
+            "flaky": False,
         }
     ]
+
+
+def test_test_results_flag_tests_known_to_be_flaky(client, session_factory, finished_run):
+    # A rerun of the same commit in which test_bad passes: test_bad is flaky.
+    with session_factory() as db:
+        first = db.get_one(Run, finished_run)
+        rerun = Run(
+            project_id=first.project_id,
+            ref=first.commit_sha,
+            commit_sha=first.commit_sha,
+            rerun_of_id=first.id,
+            status=RunStatus.PASSED,
+            attempt=1,
+            finished_at=first.finished_at + timedelta(minutes=1),
+        )
+        db.add(rerun)
+        db.flush()
+        db.add(
+            TestResult(
+                run_id=rerun.id,
+                classname="tests.test_a",
+                name="test_bad",
+                outcome=Outcome.PASSED,
+                duration_seconds=0.2,
+            )
+        )
+        db.commit()
+
+    tests = client.get(f"/runs/{finished_run}/tests").json()
+
+    assert {t["name"]: t["flaky"] for t in tests} == {
+        "test_ok": False,
+        "test_bad": True,
+        "test_later": False,
+    }
+
+
+def test_rerun_queues_the_same_commit(client, finished_run):
+    response = client.post(f"/runs/{finished_run}/rerun")
+
+    assert response.status_code == 202
+    rerun = response.json()
+    assert (rerun["status"], rerun["ref"], rerun["rerun_of_id"]) == (
+        "queued",
+        "a" * 40,
+        finished_run,
+    )
+
+
+def test_a_rerun_of_a_rerun_points_to_the_first_run(client, session_factory, finished_run):
+    second = client.post(f"/runs/{finished_run}/rerun").json()
+    with session_factory() as db:
+        db.get_one(Run, second["id"]).commit_sha = "a" * 40  # as if it had run
+        db.commit()
+
+    third = client.post(f"/runs/{second['id']}/rerun").json()
+
+    assert third["rerun_of_id"] == finished_run
+
+
+def test_a_run_without_a_commit_cannot_be_rerun(client, make_project, queue_run):
+    run_id = queue_run(make_project())  # still queued: no commit checked out yet
+
+    assert client.post(f"/runs/{run_id}/rerun").status_code == 409
+    assert client.post("/runs/999/rerun").status_code == 404
 
 
 def test_get_log_as_plain_text(client, finished_run):

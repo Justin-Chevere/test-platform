@@ -22,12 +22,13 @@ from collections.abc import Iterator
 from contextlib import contextmanager, suppress
 from datetime import UTC, datetime
 
-from sqlalchemy import update
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.config import Settings, get_settings
-from app.db import Base, SessionLocal, engine
+from app.db import SessionLocal, engine
+from app.migrate import SchemaOutOfDate, check_schema
 from app.models import Project, Run, RunStatus, TestResult
 from app.run_queue import Claim, claim_next_run, held, recover_abandoned_runs, send_heartbeat
 from app.runner import LocalRunner, Outcome, Runner, RunResult, RunSpec
@@ -86,14 +87,12 @@ def execute_run(
         stopped = RunResult(error="the worker was stopped during this run")
         _save(session_factory, claim, stopped, decide_status(stopped))
         raise
-    status = decide_status(result)
-    if not _save(session_factory, claim, result, status):
+    if not _save(session_factory, claim, result, decide_status(result)):
         logger.warning(
             "run #%d: another worker has taken this run over; discarding this result",
             claim.run_id,
         )
         return False
-    logger.info("run #%d: %s", claim.run_id, status)
     return True
 
 
@@ -170,8 +169,40 @@ def _save(
             )
             for case in result.cases
         )
-        db.commit()  # the status and every test result land together, or not at all
+        rerun_id = None
+        if status == RunStatus.FAILED and result.commit_sha is not None:
+            rerun_id = _queue_auto_rerun(db, claim.run_id, result.commit_sha)
+        # The status, every test result and any rerun land together, or not at all.
+        db.commit()
+    logger.info("run #%d: %s", claim.run_id, status)
+    if rerun_id is not None:
+        logger.info(
+            "run #%d: queued run #%d to test commit %s again",
+            claim.run_id,
+            rerun_id,
+            result.commit_sha[:12],
+        )
     return True
+
+
+def _queue_auto_rerun(db: Session, run_id: int, commit_sha: str) -> int | None:
+    """Queue a failed run's commit again, if its project allows another rerun.
+
+    Tests that fail and then pass on the same commit are flaky (see app/flaky.py).
+    Returns the new run's id, or None if the project has no reruns left for it.
+    """
+    run = db.get_one(Run, run_id)
+    project = db.get_one(Project, run.project_id)
+    first_run_id = run.rerun_of_id or run.id
+    reruns_so_far = db.scalar(
+        select(func.count()).select_from(Run).where(Run.rerun_of_id == first_run_id)
+    )
+    if reruns_so_far >= project.auto_reruns:
+        return None
+    rerun = Run(project_id=project.id, ref=commit_sha, rerun_of_id=first_run_id)
+    db.add(rerun)
+    db.flush()  # assigns its id
+    return rerun.id
 
 
 def run_worker(
@@ -210,7 +241,10 @@ def main() -> None:
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     settings = get_settings()
-    Base.metadata.create_all(engine)
+    try:
+        check_schema(engine)
+    except SchemaOutOfDate as exc:
+        parser.exit(1, f"error: {exc}\n")
     runner = LocalRunner(settings.workspace_dir, settings.max_log_bytes)
     with suppress(KeyboardInterrupt):
         run_worker(SessionLocal, runner, settings, once=args.once)
