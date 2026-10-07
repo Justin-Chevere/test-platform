@@ -304,6 +304,7 @@ def test_a_failed_run_queues_a_rerun_of_its_commit(session_factory, make_project
     assert first.id == run_id
     # The exact commit that failed, not the branch, which may have moved on since.
     assert (rerun.status, rerun.ref, rerun.rerun_of_id) == (RunStatus.QUEUED, COMMIT, run_id)
+    assert rerun.triggered_by is None  # automatic: nobody asked for it
 
 
 @pytest.mark.parametrize(

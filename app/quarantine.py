@@ -35,18 +35,25 @@ class QuarantineEntry:
     classname: str
     name: str
     reason: str
+    created_by: str | None
     created_at: datetime
     runs_since: int  # runs since it went into quarantine that included the test...
     failures_since: int  # ...and how many of those it failed or errored in
 
 
 def quarantine_test(
-    db: Session, project_id: int, classname: str, name: str, reason: str
+    db: Session, project_id: int, classname: str, name: str, reason: str, created_by: str
 ) -> int:
     """Quarantine a flaky test, and return the entry's id."""
     if (classname, name) not in flaky_test_names(db, project_id):
         raise NotFlaky
-    entry = QuarantinedTest(project_id=project_id, classname=classname, name=name, reason=reason)
+    entry = QuarantinedTest(
+        project_id=project_id,
+        classname=classname,
+        name=name,
+        reason=reason,
+        created_by=created_by,
+    )
     db.add(entry)
     try:
         db.commit()
@@ -112,6 +119,7 @@ def list_quarantine(db: Session, project_id: int) -> list[QuarantineEntry]:
             classname=entry.classname,
             name=entry.name,
             reason=entry.reason,
+            created_by=entry.created_by,
             created_at=entry.created_at,
             runs_since=runs_since,
             failures_since=failures_since,

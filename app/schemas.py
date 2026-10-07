@@ -1,14 +1,50 @@
 from datetime import date, datetime
 from pathlib import PurePosixPath, PureWindowsPath
-from typing import Annotated
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator
 
-from app.models import RunStatus
+from app.models import Role, RunStatus
 from app.runner import Outcome
 
 # A branch, tag or commit. It can't start with "-", so git can never read it as an option.
 Ref = Annotated[str, Field(min_length=1, max_length=255, pattern=r"^[\w.][\w./-]*$")]
+
+# Length matters more than complexity rules. The cap only bounds the hashing work.
+Password = Annotated[str, Field(min_length=12, max_length=128)]
+
+
+class Token(BaseModel):
+    access_token: str
+    token_type: Literal["bearer"] = "bearer"
+    expires_in: int  # seconds
+
+
+class UserCreate(BaseModel):
+    username: str = Field(pattern=r"^[a-z0-9][a-z0-9_.-]{2,31}$")
+    password: Password
+    role: Role = Role.VIEWER
+
+
+class UserUpdate(BaseModel):
+    role: Role | None = None
+    is_active: bool | None = None
+
+
+class UserOut(BaseModel):
+    # No password_hash here: it never leaves the server.
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    username: str
+    role: Role
+    is_active: bool
+    created_at: datetime
+
+
+class PasswordChange(BaseModel):
+    current_password: str = Field(max_length=128)
+    new_password: Password
 
 
 class ProjectCreate(BaseModel):
@@ -67,6 +103,7 @@ class RunOut(BaseModel):
     ref: str
     commit_sha: str | None
     rerun_of_id: int | None  # set when this run tests the same commit as an earlier one
+    triggered_by: str | None  # who queued it; None for an automatic rerun
     status: RunStatus
     worker_id: str | None
     attempt: int
@@ -136,6 +173,7 @@ class QuarantinedTestOut(BaseModel):
     classname: str
     name: str
     reason: str
+    created_by: str | None  # who quarantined it
     created_at: datetime
     runs_since: int  # runs since it went into quarantine that included the test...
     failures_since: int  # ...and how many of those it failed or errored in

@@ -1,13 +1,14 @@
 from typing import Annotated
 
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.auth import AdminUser, DeveloperUser, require_role
 from app.db import DbSession
 from app.flaky import FlakyTest, find_flaky_tests
-from app.models import Project, Run
+from app.models import Project, Role, Run
 from app.quarantine import (
     AlreadyQuarantined,
     NotFlaky,
@@ -26,7 +27,13 @@ from app.schemas import (
     RunOut,
 )
 
-router = APIRouter(prefix="/projects", tags=["projects"])
+router = APIRouter(
+    prefix="/projects",
+    tags=["projects"],
+    # Deny by default: every route needs at least a signed-in viewer, and the routes
+    # that change things raise that further.
+    dependencies=[Depends(require_role(Role.VIEWER))],
+)
 
 
 def _get_or_404(db: Session, project_id: int) -> Project:
@@ -37,7 +44,8 @@ def _get_or_404(db: Session, project_id: int) -> Project:
 
 
 @router.post("", response_model=ProjectOut, status_code=status.HTTP_201_CREATED)
-def create_project(payload: ProjectCreate, db: DbSession) -> Project:
+def create_project(payload: ProjectCreate, db: DbSession, admin: AdminUser) -> Project:
+    """Register a repository. Admins only: its commands are what workers will run."""
     project = Project(**payload.model_dump())
     db.add(project)
     try:
@@ -60,11 +68,13 @@ def get_project(project_id: int, db: DbSession) -> Project:
 
 
 @router.post("/{project_id}/runs", response_model=RunOut, status_code=status.HTTP_202_ACCEPTED)
-def trigger_run(project_id: int, db: DbSession, payload: RunCreate | None = None) -> Run:
+def trigger_run(
+    project_id: int, db: DbSession, user: DeveloperUser, payload: RunCreate | None = None
+) -> Run:
     # 202, not 201: the run is only queued here. A worker picks it up and executes it.
     project = _get_or_404(db, project_id)
     ref = payload.ref if payload and payload.ref else project.default_branch
-    run = Run(project_id=project.id, ref=ref)
+    run = Run(project_id=project.id, ref=ref, triggered_by=user.username)
     db.add(run)
     db.commit()
     db.refresh(run)
@@ -100,11 +110,15 @@ def list_quarantined_tests(project_id: int, db: DbSession) -> list[QuarantineEnt
     response_model=QuarantinedTestOut,
     status_code=status.HTTP_201_CREATED,
 )
-def quarantine(project_id: int, payload: QuarantineCreate, db: DbSession) -> QuarantineEntry:
+def quarantine(
+    project_id: int, payload: QuarantineCreate, db: DbSession, user: DeveloperUser
+) -> QuarantineEntry:
     """Stop a flaky test's failures from failing runs, until it's released."""
     _get_or_404(db, project_id)
     try:
-        entry_id = quarantine_test(db, project_id, payload.classname, payload.name, payload.reason)
+        entry_id = quarantine_test(
+            db, project_id, payload.classname, payload.name, payload.reason, user.username
+        )
     except NotFlaky:
         raise HTTPException(
             status.HTTP_409_CONFLICT,
@@ -117,7 +131,7 @@ def quarantine(project_id: int, payload: QuarantineCreate, db: DbSession) -> Qua
 
 
 @router.delete("/{project_id}/quarantine/{entry_id}", status_code=status.HTTP_204_NO_CONTENT)
-def release(project_id: int, entry_id: int, db: DbSession) -> None:
+def release(project_id: int, entry_id: int, db: DbSession, user: DeveloperUser) -> None:
     """Take a test out of quarantine: from the next run on, its failures count again."""
     _get_or_404(db, project_id)
     if not release_test(db, project_id, entry_id):

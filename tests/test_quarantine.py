@@ -62,10 +62,11 @@ def test_quarantine_a_flaky_test(client, project_id):
 
     assert response.status_code == 201
     entry = response.json()
-    assert (entry["classname"], entry["name"], entry["reason"]) == (
+    assert (entry["classname"], entry["name"], entry["reason"], entry["created_by"]) == (
         "tests.test_api",
         "test_timing",
         REASON,
+        "admin",  # who the client is logged in as
     )
     assert (entry["runs_since"], entry["failures_since"]) == (0, 0)
     assert client.get(f"/projects/{project_id}/quarantine").json() == [entry]

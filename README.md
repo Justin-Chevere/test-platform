@@ -24,6 +24,8 @@ seconds.
       while real failures still fail them
 - [x] Trends: the slowest and most-failing tests, each next to the same numbers from the runs
       before, and a daily summary of runs, pass rate and run time
+- [x] Logins with roles (viewer, developer, admin), brute-force protection, and a record of who
+      triggered each run and quarantined each test
 - [x] Schema migrations (Alembic), checked against the models by a test
 - [x] Local runner: a fresh checkout and virtualenv for every run, a time limit, and no process
       left running afterwards
@@ -32,10 +34,10 @@ seconds.
 
 ## Next steps
 
-1. **Docker runner:** run each job in a throwaway container, so untrusted code can't touch the
+1. **Web dashboard:** runs, results, flaky tests, quarantine and trends in a browser.
+2. **Docker runner:** run each job in a throwaway container, so untrusted code can't touch the
    machine.
-2. **GitHub integration:** start runs from push webhooks, and report pass or fail on each commit.
-3. **Logins**, then a web dashboard.
+3. **GitHub integration:** start runs from push webhooks, and report pass or fail on each commit.
 
 ## How it works
 
@@ -228,12 +230,51 @@ only for private repositories. The Docker runner (next steps) is what makes untr
 
 Meanwhile:
 
+- **Only admins register projects**, because a project's commands are what the workers run (see
+  [Logins and roles](#logins-and-roles)).
 - **Only `https://` repositories** can be registered: no `file://` paths into this machine, and no
   URL or branch name that git could mistake for a command-line option.
-- **The API only answers to `localhost`.** It can make this machine run commands and has no logins
-  yet, so requests addressed to any other host name get `400`. That blocks DNS rebinding, where a
-  web page points its own domain at `127.0.0.1` to reach local services through your browser.
+- **The API only answers to `localhost`** (`ALLOWED_HOSTS`): requests addressed to any other host
+  name get `400`. That blocks DNS rebinding, where a web page points its own domain at `127.0.0.1`
+  to reach local services through your browser.
 - **Report paths** must stay inside the repository.
+
+## Logins and roles
+
+Every endpoint needs a login, except `/health` and logging in itself.
+
+| Role | Can |
+|------|-----|
+| `viewer` | Read everything: projects, runs, results, logs, flaky tests, quarantine, trends |
+| `developer` | Everything a viewer can, plus trigger runs and reruns, and quarantine or release tests |
+| `admin` | Everything a developer can, plus register projects and manage users |
+
+Registering a project is an admin's call for a reason: its setup and test commands are what the
+workers will run on their machines, so choosing them is as good as having a shell there.
+
+- **Login:** `POST /auth/token` (the OAuth2 password flow) returns a signed token that expires
+  after 30 minutes. A wrong password and an unknown username get the same answer in the same
+  time, so the endpoint never reveals which accounts exist.
+- **Passwords** are hashed with Argon2id, at least 12 characters long, and never returned.
+- **Tokens carry only the user's id and a version number.** The user and role are loaded on every
+  request, so deactivating someone or changing their role applies at once, even to tokens already
+  issued. The signing algorithm is fixed by the server, never taken from the token, so a forged
+  `"alg": "none"` token gets nowhere.
+- **Changing your password** (`POST /auth/password`) bumps the version, which ends every other
+  session; the request itself gets a fresh token.
+- **Brute-force protection:** after 5 failed logins for one account, or 20 from one client address,
+  within 15 minutes, further attempts get `429` with a `Retry-After` header, and the password isn't
+  even checked. Password changes count against the same limits, so a stolen token can't be used to
+  guess the current password either.
+- **Who did what:** every run records who triggered it (or that it was an automatic rerun), and every
+  quarantine entry records who made it.
+- **Deny by default:** routers require a viewer, and a test walks every endpoint in the OpenAPI
+  schema and fails if any non-public one answers without a login.
+- **Lost the only admin password?** `python -m app.cli set-password <username>` sets a new one from
+  the server, and ends that user's sessions.
+
+Tried for real, with the default limits: five wrong guesses at a password got `401` each, and then
+even the right password got `429` with `Retry-After: 900`.
 
 ## Run it
 
@@ -244,6 +285,7 @@ python -m venv .venv
 .venv\Scripts\activate        # Windows
 pip install -e ".[dev]"
 alembic upgrade head             # create the database, or bring it up to date
+python -m app.cli create-user admin --role admin    # the first admin; prompts for a password
 
 uvicorn app.main:app --reload    # terminal 1: the API
 python -m app.worker             # terminal 2: a worker (start more for parallel runs)
@@ -252,7 +294,10 @@ python -m app.worker             # terminal 2: a worker (start more for parallel
 After pulling changes, run `alembic upgrade head` again. The API and workers refuse to start on an
 outdated schema, and say which command fixes it.
 
-Then open http://127.0.0.1:8000/docs and try:
+Set `JWT_SECRET` (see `.env.example`) for anything beyond local development. Without it, a random
+secret is generated at startup and every login resets when the API restarts.
+
+Then open http://127.0.0.1:8000/docs, click **Authorize**, sign in, and try:
 
 1. `POST /projects`:
    ```json
@@ -273,6 +318,7 @@ Then open http://127.0.0.1:8000/docs and try:
    flaky test's failures from failing runs; `GET /projects/1/quarantine` lists the quarantine.
 6. `GET /projects/1/trends/slowest-tests`, `.../failing-tests` and `.../daily` show where the
    suite spends its time, what keeps failing, and which way both are heading.
+7. `POST /users` adds teammates, as viewers, developers or admins.
 
 `python -m app.worker --once` runs everything queued and exits, which is handy for scripts.
 
@@ -311,9 +357,13 @@ the migrations alone, compare it with the models, and undo and redo every migrat
 |------|----------------|
 | `app/config.py` | Settings from environment variables |
 | `app/db.py` | Engine (SQLite in WAL mode), session factory, per-request session dependency |
-| `app/models.py` | Database tables: projects, runs, test results |
+| `app/models.py` | Database tables: projects, runs, test results, quarantine, users |
 | `app/schemas.py` | Request and response shapes, validation |
-| `app/routers/` | HTTP endpoints: health, projects, runs, trends |
+| `app/routers/` | HTTP endpoints: health, auth, users, projects, runs, trends |
+| `app/auth.py` | Login check, current-user and role dependencies |
+| `app/security.py` | Password hashing and token signing |
+| `app/throttle.py` | Sliding-window failure counters behind the brute-force protection |
+| `app/cli.py` | Command line: create users (the first admin), set a lost password |
 | `app/run_queue.py` | Claims runs atomically, renews leases, recovers abandoned runs |
 | `app/worker.py` | Worker loop: recover, claim, execute with heartbeats, save the outcome if still held, rerun failures |
 | `app/flaky.py` | Finds flaky tests: passed and failed on the same commit |
@@ -325,4 +375,4 @@ the migrations alone, compare it with the models, and undo and redo every migrat
 | `app/runner/local.py` | Runs a job on this machine: checkout, virtualenv, commands, cleanup |
 | `app/runner/junit.py` | Reads JUnit XML reports |
 | `app/main.py` | Application factory |
-| `tests/` | API, queue, worker, flaky, quarantine, trends and migration tests on a fresh database file each; runner tests end to end |
+| `tests/` | API, auth, queue, worker, flaky, quarantine, trends and migration tests on a fresh database file each; runner tests end to end |

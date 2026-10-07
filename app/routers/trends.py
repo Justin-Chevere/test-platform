@@ -1,14 +1,19 @@
 from typing import Annotated
 
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
+from app.auth import require_role
 from app.db import DbSession
-from app.models import Project
+from app.models import Project, Role
 from app.schemas import DaySummaryOut, TestTrendOut
 from app.trends import DaySummary, TestTrend, daily_summary, failing_tests, slowest_tests
 
-router = APIRouter(prefix="/projects/{project_id}/trends", tags=["trends"])
+router = APIRouter(
+    prefix="/projects/{project_id}/trends",
+    tags=["trends"],
+    dependencies=[Depends(require_role(Role.VIEWER))],  # deny by default
+)
 
 # How many of the most recently finished runs to look at. Each test's numbers come with
 # the same number of runs before those, for comparison.

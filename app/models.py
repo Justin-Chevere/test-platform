@@ -20,6 +20,16 @@ class RunStatus(enum.StrEnum):
     ERROR = "error"  # the tests couldn't run or report: a bad ref, a failed setup, a timeout
 
 
+class Role(enum.StrEnum):
+    """Least to most access. Each role can do everything the ones before it can."""
+
+    VIEWER = "viewer"  # read everything: projects, runs, results, logs, trends
+    DEVELOPER = "developer"  # + trigger runs and reruns, quarantine and release tests
+    # + register projects and manage users. A project's commands are what workers run on
+    # their machines, so choosing them is as good as a shell there: an admin's call.
+    ADMIN = "admin"
+
+
 class UTCDateTime(TypeDecorator[datetime]):
     """A datetime column that always comes back timezone-aware UTC, on every database.
 
@@ -91,6 +101,9 @@ class Run(Base):
     # Set on a run that tests the same commit as an earlier one: the first run of that
     # commit, which every rerun points to, whether it was asked for or automatic.
     rerun_of_id: Mapped[int | None] = mapped_column(ForeignKey("runs.id"), index=True)
+    # Who queued it, or None for an automatic rerun. A username rather than a foreign key,
+    # so the record reads the same forever; users are deactivated, never deleted.
+    triggered_by: Mapped[str | None] = mapped_column(String(32))
     status: Mapped[RunStatus] = mapped_column(_enum_column(RunStatus), default=RunStatus.QUEUED)
     worker_id: Mapped[str | None] = mapped_column(String(255))
     # How many times a worker has claimed this run: more than once if a worker died
@@ -143,4 +156,22 @@ class QuarantinedTest(Base):
     classname: Mapped[str] = mapped_column(Text)
     name: Mapped[str] = mapped_column(Text)
     reason: Mapped[str] = mapped_column(Text)  # why, and who is fixing it
+    # Who quarantined it: None only for entries from before there were logins.
+    created_by: Mapped[str | None] = mapped_column(String(32))
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=_now)
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    username: Mapped[str] = mapped_column(String(32), unique=True)
+    password_hash: Mapped[str] = mapped_column(String(255))
+    role: Mapped[Role] = mapped_column(_enum_column(Role), default=Role.VIEWER)
+    # Deactivated rather than deleted: their tokens stop working at once, and the runs
+    # and quarantine entries that name them keep making sense.
+    is_active: Mapped[bool] = mapped_column(default=True)
+    # Copied into every token. A password change bumps it, which retires every token
+    # issued before the change.
+    token_version: Mapped[int] = mapped_column(default=0)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=_now)

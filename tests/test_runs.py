@@ -122,10 +122,11 @@ def test_rerun_queues_the_same_commit(client, finished_run):
 
     assert response.status_code == 202
     rerun = response.json()
-    assert (rerun["status"], rerun["ref"], rerun["rerun_of_id"]) == (
+    assert (rerun["status"], rerun["ref"], rerun["rerun_of_id"], rerun["triggered_by"]) == (
         "queued",
         "a" * 40,
         finished_run,
+        "admin",  # who the client is logged in as
     )
 
 

@@ -1,3 +1,4 @@
+import secrets
 from functools import lru_cache
 from pathlib import Path
 from typing import Self
@@ -16,6 +17,17 @@ class Settings(BaseSettings):
 
     # Host names the API answers to. See create_app() for why this matters.
     allowed_hosts: list[str] = ["localhost", "127.0.0.1"]
+
+    # Signs login tokens. There is deliberately no fixed default (the repo is public):
+    # unset, each start makes a random one, so logins reset whenever the API restarts.
+    jwt_secret: str = Field(default_factory=lambda: secrets.token_urlsafe(32), min_length=32)
+    access_token_minutes: int = Field(default=30, gt=0)
+
+    # Brute-force protection for POST /auth/token: failed logins allowed per account and
+    # per client address within the window. Further attempts get 429 until it passes.
+    login_max_failures_per_account: int = Field(default=5, gt=0)
+    login_max_failures_per_client: int = Field(default=20, gt=0)
+    login_failure_window_seconds: int = Field(default=900, gt=0)
 
     # Where workers check out code and build virtualenvs. Unset: the system temp folder.
     # On Windows, keep it short: in a deep folder, the files a virtualenv installs can

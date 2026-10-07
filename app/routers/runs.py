@@ -1,15 +1,20 @@
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import PlainTextResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.auth import DeveloperUser, require_role
 from app.db import DbSession
 from app.flaky import flaky_test_names
-from app.models import Run, TestResult
+from app.models import Role, Run, TestResult
 from app.runner import Outcome
 from app.schemas import RunOut, TestResultOut
 
-router = APIRouter(prefix="/runs", tags=["runs"])
+router = APIRouter(
+    prefix="/runs",
+    tags=["runs"],
+    dependencies=[Depends(require_role(Role.VIEWER))],  # deny by default
+)
 
 
 def _get_or_404(db: Session, run_id: int) -> Run:
@@ -25,7 +30,7 @@ def get_run(run_id: int, db: DbSession) -> Run:
 
 
 @router.post("/{run_id}/rerun", response_model=RunOut, status_code=status.HTTP_202_ACCEPTED)
-def rerun(run_id: int, db: DbSession) -> Run:
+def rerun(run_id: int, db: DbSession, user: DeveloperUser) -> Run:
     """Queue the same commit again, e.g. to find out whether a failure is flaky."""
     run = _get_or_404(db, run_id)
     if run.commit_sha is None:
@@ -36,7 +41,12 @@ def rerun(run_id: int, db: DbSession) -> Run:
         )
     # Every rerun points to the commit's first run, so they can be counted together.
     first_run_id = run.rerun_of_id or run.id
-    again = Run(project_id=run.project_id, ref=run.commit_sha, rerun_of_id=first_run_id)
+    again = Run(
+        project_id=run.project_id,
+        ref=run.commit_sha,
+        rerun_of_id=first_run_id,
+        triggered_by=user.username,
+    )
     db.add(again)
     db.commit()
     db.refresh(again)
